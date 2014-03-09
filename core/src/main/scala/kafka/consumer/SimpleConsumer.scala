@@ -32,38 +32,27 @@ class SimpleConsumer(val host: String,
                      val port: Int,
                      val soTimeout: Int,
                      val bufferSize: Int) extends Logging {
-  private var channel : SocketChannel = null
   private val lock = new Object()
+  private val blockingChannel = new BlockingChannel(host, port, bufferSize, BlockingChannel.UseDefaultBufferSize, soTimeout)
+  private var isClosed = false
 
-  private def connect(): SocketChannel = {
+  private def connect(): BlockingChannel = {
     close
-    val address = new InetSocketAddress(host, port)
-
-    val channel = SocketChannel.open
-    debug("Connected to " + address + " for fetching.")
-    channel.configureBlocking(true)
-    channel.socket.setReceiveBufferSize(bufferSize)
-    channel.socket.setSoTimeout(soTimeout)
-    channel.socket.setKeepAlive(true)
-    channel.socket.setTcpNoDelay(true)
-    channel.connect(address)
-    trace("requested receive buffer size=" + bufferSize + " actual receive buffer size= " + channel.socket.getReceiveBufferSize)
-    trace("soTimeout=" + soTimeout + " actual soTimeout= " + channel.socket.getSoTimeout)
-    
-    channel
+    blockingChannel.connect()
+    blockingChannel
   }
 
-  private def close(channel: SocketChannel) = {
-    debug("Disconnecting from " + channel.socket.getRemoteSocketAddress())
-    Utils.swallow(logger.warn, channel.close())
-    Utils.swallow(logger.warn, channel.socket.close())
+  private def disconnect() = {
+    if(blockingChannel.isConnected) {
+      debug("Disconnecting from " + host + ":" + port)
+      blockingChannel.disconnect()
+    }
   }
 
   def close() {
     lock synchronized {
-      if (channel != null)
-        close(channel)
-      channel = null
+      disconnect()
+      isClosed = true
     }
   }
 
@@ -86,11 +75,11 @@ class SimpleConsumer(val host: String,
           info("Reconnect in fetch request due to socket error: ", e)
           // retry once
           try {
-            channel = connect
+            connect
             sendRequest(request)
             response = getResponse
           }catch {
-            case ioe: java.io.IOException => channel = null; throw ioe;
+            case ioe: java.io.IOException => blockingChannel.disconnect(); throw ioe;
           }
         case e => throw e
       }
@@ -120,11 +109,11 @@ class SimpleConsumer(val host: String,
           info("Reconnect in multifetch due to socket error: ", e)
           // retry once
           try {
-            channel = connect
+            connect
             sendRequest(new MultiFetchRequest(fetches.toArray))
             response = getResponse
           }catch {
-            case ioe: java.io.IOException => channel = null; throw ioe;
+            case ioe: java.io.IOException => blockingChannel.disconnect(); throw ioe;
           }
         case e => throw e        
       }
@@ -156,11 +145,11 @@ class SimpleConsumer(val host: String,
           info("Reconnect in get offetset request due to socket error: ", e)
           // retry once
           try {
-            channel = connect
+            connect
             sendRequest(new OffsetRequest(topic, partition, time, maxNumOffsets))
             response = getResponse
           }catch {
-            case ioe: java.io.IOException => channel = null; throw ioe;
+            case ioe: java.io.IOException => blockingChannel.disconnect(); throw ioe;
           }
       }
       OffsetRequest.deserializeOffsetArray(response._1.buffer)
@@ -168,13 +157,11 @@ class SimpleConsumer(val host: String,
   }
 
   private def sendRequest(request: Request) = {
-    val send = new BoundedByteBufferSend(request)
-    send.writeCompletely(channel)
+    blockingChannel.send(request)
   }
 
   private def getResponse(): Tuple2[Receive,Int] = {
-    val response = new BoundedByteBufferReceive()
-    response.readCompletely(channel)
+    val response = blockingChannel.receive()
 
     // this has the side effect of setting the initial position of buffer correctly
     val errorCode: Int = response.buffer.getShort
@@ -182,8 +169,8 @@ class SimpleConsumer(val host: String,
   }
 
   private def getOrMakeConnection() {
-    if(channel == null) {
-      channel = connect()
+    if(!isClosed && !blockingChannel.isConnected) {
+      connect()
     }
   }
 }
